@@ -27,7 +27,7 @@ impl PosthogClient {
     }
 
     pub(crate) fn new(base_url: String, api_key: String) -> Self {
-        let (_, worker_tx) = QueueWorker::start(base_url);
+        let worker_tx = QueueWorker::start(base_url);
         let client = Self {
             api_key,
             worker_tx,

@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use reqwest::{Client, Method};
 use serde_json::{json, Value};
 use tokio::{
@@ -68,14 +66,14 @@ pub(crate) struct QueuedRequest {
     pub(crate) response_tx: Option<Sender<Result<Value, PosthogError>>>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct QueueWorker {
     pub(crate) base_url: String,
-    pub(crate) client: Client,   
+    pub(crate) client: Client,
 }
 
 impl QueueWorker {
-    pub(crate) fn start(base_url: String) -> (Arc<Self>, UnboundedSender<QueuedRequest>) {
+    pub(crate) fn start(base_url: String) -> UnboundedSender<QueuedRequest> {
         let (tx, mut rx) = unbounded_channel::<QueuedRequest>();
 
         let worker = Self {
@@ -83,74 +81,69 @@ impl QueueWorker {
             client: Client::new(),
         };
 
-        let worker = Arc::new(worker);
+        tokio::spawn(async move {
+            let mut queued_requests = Vec::new();
+            let mut flush_timer = interval(Duration::from_secs(1));
 
-        {
-            let worker = Arc::clone(&worker);
+            loop {
+                select! {
+                    Some(request) = rx.recv() => {
+                        if request.immediate {
+                            worker.dispatch_request(request);
+                        } else {
+                            queued_requests.push(request);
+                        }
+                    },
 
-            tokio::spawn(async move {
-                let mut queued_requests = Vec::new();
-                let mut flush_timer = interval(Duration::from_secs(1));
+                    _ = flush_timer.tick() => {
+                        if queued_requests.is_empty() {
+                            continue;
+                        }
 
-                loop {
-                    select! {
-                        Some(request) = rx.recv() => {
-                            if request.immediate {
-                                worker.dispatch_request(Arc::clone(&worker), request).await;
-                            } else {
-                                queued_requests.push(request);
-                            }
-                        },
+                        let mut requests = Vec::new();
+                        std::mem::swap(&mut queued_requests, &mut requests);
 
-                        _ = flush_timer.tick() => {
-                            if queued_requests.is_empty() {
-                                continue;
-                            }
+                        let mut batch_capture = Vec::new();
 
-                            let mut requests = Vec::new();
-                            std::mem::swap(&mut queued_requests, &mut requests);
+                        for request in requests {
+                            match request.request {
+                                PosthogRequest::CaptureEvent { body } if request.response_tx.is_none() => {
+                                    batch_capture.push(body);
+                                }
 
-                            let mut batch_capture = Vec::new();
-
-                            for request in requests {
-                                match request.request {
-                                    PosthogRequest::CaptureEvent { body } if request.response_tx.is_none() => {
-                                        batch_capture.push(body);
-                                    }
-
-                                    _ => {
-                                        worker.dispatch_request(Arc::clone(&worker), request).await;
-                                    }
+                                _ => {
+                                    worker.dispatch_request(request);
                                 }
                             }
+                        }
 
-                            if !batch_capture.is_empty() {
-                                // The API key is added by the client to each event, so we can just take it from the first event.
-                                let api_key = batch_capture[0]["api_key"].as_str().unwrap();
+                        if !batch_capture.is_empty() {
+                            // The API key is added by the client to each event, so we can just take it from the first event.
+                            let api_key = batch_capture[0]["api_key"].as_str().unwrap();
 
-                                let body = json!({
-                                    "api_key": api_key,
-                                    "batch": batch_capture,
-                                 });
+                            let body = json!({
+                                "api_key": api_key,
+                                "batch": batch_capture,
+                             });
 
-                                let request = QueuedRequest {
-                                    request: PosthogRequest::CaptureBatch { body },
-                                    immediate: true,
-                                    response_tx: None,
-                                };
+                            let request = QueuedRequest {
+                                request: PosthogRequest::CaptureBatch { body },
+                                immediate: true,
+                                response_tx: None,
+                            };
 
-                                worker.dispatch_request(Arc::clone(&worker), request).await;
-                            }
+                            worker.dispatch_request(request);
                         }
                     }
                 }
-            });
-        }
+            }
+        });
 
-        (worker, tx)
+        tx
     }
 
-    async fn dispatch_request(&self, worker: Arc<Self>, request: QueuedRequest) {
+    fn dispatch_request(&self, request: QueuedRequest) {
+        let worker = self.to_owned();
         tokio::spawn(async move {
             worker.handle_request(request).await;
         });
