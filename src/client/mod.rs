@@ -11,6 +11,8 @@ use tokio::sync::mpsc;
 
 use self::queue::{QueueWorker, QueuedRequest};
 
+const POSTHOG_BATCH_LIMIT: i64 = 20; // TODO(colemickens): revisit check posthog docs
+
 #[derive(Debug, Clone)]
 pub struct PosthogClient {
     pub(crate) api_key: String,
@@ -18,7 +20,7 @@ pub struct PosthogClient {
     // NOTE(colemickens): move this to PosthogClient so that owner can
     // drop this. If its in QueueWorker, it gets cloned into the spawned thread
     // and prevents clean shutdown.
-    pub(crate) worker_tx: mpsc::UnboundedSender<QueuedRequest>,
+    pub(crate) worker: QueueWorker,
 }
 
 impl PosthogClient {
@@ -27,10 +29,10 @@ impl PosthogClient {
     }
 
     pub(crate) fn new(base_url: String, api_key: String) -> Self {
-        let worker_tx = QueueWorker::start(base_url);
+        let worker = QueueWorker::start(base_url);
         let client = Self {
             api_key,
-            worker_tx,
+            worker,
         };
         client
     }
