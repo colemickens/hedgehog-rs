@@ -18,7 +18,7 @@ impl PosthogClient {
     pub fn enqueue_event(&self, person: &Person, event: Event) -> Result<(), PosthogError> {
         let event_json = self.get_event_json(person, event);
 
-        self.worker_tx
+        self.queue_handle.tx
             .send(QueuedRequest {
                 request: PosthogRequest::CaptureEvent { body: event_json },
                 ..Default::default()
@@ -33,13 +33,10 @@ impl PosthogClient {
 
         let (tx, rx) = channel();
 
-        self.worker_tx
-            .send(QueuedRequest {
+        self.queue_handle.dispatch_request(QueuedRequest {
                 request: PosthogRequest::CaptureEvent { body: event_json },
-                immediate: true,
                 response_tx: Some(tx),
-            })
-            .map_err(|_| PosthogError::QueueError)?;
+            });
 
         rx.await.map(|_| ()).map_err(|_| PosthogError::QueueError)
     }

@@ -27,14 +27,11 @@ impl PosthogClient {
 
         let (tx, rx) = channel();
 
-        self.worker_tx
-            .send(QueuedRequest {
+        self.queue_handle.dispatch_request(QueuedRequest {
                 request: EvaluateFeatureFlags { body: json },
-                immediate: true,
                 response_tx: Some(tx),
-            })
-            .map_err(|_| PosthogError::QueueError)?;
-
+            });
+            
         let json = rx.await.map_err(|_| PosthogError::QueueError)??;
         let json = serde_json::from_value::<PartialFeatureFlagResponse>(json)?;
 

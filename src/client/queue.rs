@@ -1,15 +1,11 @@
 use reqwest::{Client, Method};
 use serde_json::{json, Value};
-use tokio::{
-    select,
-    sync::{
-        mpsc::{self, unbounded_channel, UnboundedSender},
-        oneshot::Sender,
-    },
-    time::{interval, Duration},
+use tokio::sync::{
+    mpsc::{self, unbounded_channel},
+    oneshot::Sender,
 };
 
-use crate::error::PosthogError;
+use crate::{client::POSTHOG_BATCH_LIMIT, error::PosthogError};
 
 #[derive(Debug)]
 pub enum PosthogRequest {
@@ -65,53 +61,47 @@ pub(crate) struct QueuedRequest {
     pub(crate) response_tx: Option<Sender<Result<Value, PosthogError>>>,
 }
 
-#[derive(Debug)]
-pub(crate) struct QueueWorker {
-    tx: mpsc::UnboundedSender<QueuedRequest>,
+#[derive(Clone, Debug)]
+pub(crate) struct QueueWorkerHandle {
+    pub(crate) tx: mpsc::UnboundedSender<QueuedRequest>,
+    // extra default inner client used for immediate requests
+    pub(crate) inner_client: QueueWorkerInner,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct QueueWorkerInner {
-    pub(crate) base_url: String,
-    pub(crate) client: Client,
+    pub base_url: String,
+    pub client: Client,
 }
 
-impl QueueWorker {
-    pub(crate) fn start(base_url: String) -> QueueWorker {
+impl QueueWorkerHandle {
+    pub(crate) fn start(base_url: String) -> QueueWorkerHandle {
         let (tx, mut rx) = unbounded_channel::<QueuedRequest>();
 
         let worker = QueueWorkerInner {
             base_url,
             client: Client::new(),
         };
+        let immediate_worker = worker.clone();
 
         tokio::spawn(async move {
-            // NOTE(colemickens): the mpsc acts as a queue, but we basically maintain another
-            // here so we can have this worker alawys churning on "immediate" requests.
-            // TODO(colemickens): consider, this could be:
-            // recv_many -> match None =>graecful_exit Some=>send up to limit batch
-            // and then "immediate" requests are handled by calling the right send_event whatever
-            let mut queued_requests: Vec<QueuedRequest> = Vec::new();
-            let mut flush_timer = interval(Duration::from_secs(1));
-
-            let flush = || {
-                if queued_requests.is_empty() {
+            loop {
+                let mut buffer: Vec<QueuedRequest> = Vec::new();
+                let x = rx.recv_many(&mut buffer, POSTHOG_BATCH_LIMIT).await;
+                if x == 0 {
                     return;
                 }
 
-                let mut requests = Vec::new();
-                std::mem::swap(&mut queued_requests, &mut requests);
-
                 let mut batch_capture = Vec::new();
 
-                for request in requests {
+                for request in buffer.into_iter() {
                     match request.request {
                         PosthogRequest::CaptureEvent { body } if request.response_tx.is_none() => {
                             batch_capture.push(body);
                         }
 
                         _ => {
-                            worker.dispatch_request(request);
+                            worker.handle_request(request).await;
                         }
                     }
                 }
@@ -121,47 +111,34 @@ impl QueueWorker {
                     let api_key = batch_capture[0]["api_key"].as_str().unwrap();
 
                     let body = json!({
-                        "api_key": api_key,
-                        "batch": batch_capture,
-                     });
+                       "api_key": api_key,
+                       "batch": batch_capture,
+                    });
 
                     let request = QueuedRequest {
                         request: PosthogRequest::CaptureBatch { body },
-                        immediate: true,
                         response_tx: None,
                     };
 
-                    worker.dispatch_request(request);
-                }
-            };
-
-            loop {
-                select! {
-                    Some(request) = rx.recv_many(POSTHOG_BATCH_LIMIT) => {
-                        if request.immediate {
-                            worker.dispatch_request(request);
-                        } else {
-                            queued_requests.push(request);
-                        }
-                    },
-
-                    _ = flush_timer.tick() => {
-                        flush();
-                    }
+                    worker.handle_request(request).await;
                 }
             }
         });
 
-        tx
+        QueueWorkerHandle {
+            tx,
+            inner_client: immediate_worker,
+        }
     }
 
-    fn dispatch_request(&self, request: QueuedRequest) {
-        let worker = self.to_owned();
+    pub fn dispatch_request(&self, request: QueuedRequest) {
+        let worker = self.inner_client.clone();
         tokio::spawn(async move {
             worker.handle_request(request).await;
         });
     }
-
+}
+impl QueueWorkerInner {
     async fn handle_request(&self, request: QueuedRequest) {
         let (method, endpoint, body) = match request.request {
             PosthogRequest::CaptureEvent { body } => (Method::POST, "capture".to_string(), body),
