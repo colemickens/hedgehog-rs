@@ -71,19 +71,16 @@ pub(crate) struct QueuedRequest {
 #[derive(Debug)]
 pub(crate) struct QueueWorker {
     pub(crate) base_url: String,
-    pub(crate) client: Client,
-
-    pub(crate) tx: UnboundedSender<QueuedRequest>,
+    pub(crate) client: Client,   
 }
 
 impl QueueWorker {
-    pub(crate) fn new(base_url: String) -> Arc<Self> {
+    pub(crate) fn start(base_url: String) -> (Arc<Self>, UnboundedSender<QueuedRequest>) {
         let (tx, mut rx) = unbounded_channel::<QueuedRequest>();
 
         let worker = Self {
             base_url,
             client: Client::new(),
-            tx,
         };
 
         let worker = Arc::new(worker);
@@ -103,7 +100,7 @@ impl QueueWorker {
                             } else {
                                 queued_requests.push(request);
                             }
-                        }
+                        },
 
                         _ = flush_timer.tick() => {
                             if queued_requests.is_empty() {
@@ -150,7 +147,7 @@ impl QueueWorker {
             });
         }
 
-        worker
+        (worker, tx)
     }
 
     async fn dispatch_request(&self, worker: Arc<Self>, request: QueuedRequest) {

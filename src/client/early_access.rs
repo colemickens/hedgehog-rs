@@ -40,8 +40,7 @@ impl PosthogClient {
     pub async fn early_access_features(&self) -> Result<Vec<EarlyAccessFeature>, PosthogError> {
         let (tx, rx) = channel();
 
-        self.queue_worker
-            .tx
+        self.worker_tx
             .send(QueuedRequest {
                 request: GetEarlyAccessFeatures {
                     api_key: self.api_key.clone(),

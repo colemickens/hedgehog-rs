@@ -27,8 +27,7 @@ impl PosthogClient {
 
         let (tx, rx) = channel();
 
-        self.queue_worker
-            .tx
+        self.worker_tx
             .send(QueuedRequest {
                 request: EvaluateFeatureFlags { body: json },
                 immediate: true,
